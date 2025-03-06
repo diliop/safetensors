@@ -2,19 +2,20 @@
 //! Dummy doc
 use memmap2::{Mmap, MmapOptions};
 use pyo3::exceptions::{PyException, PyFileNotFoundError};
-use pyo3::sync::GILOnceCell;
 use pyo3::prelude::*;
+use pyo3::sync::GILOnceCell;
 use pyo3::types::IntoPyDict;
-use pyo3::types::PySlice;
-use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList};
+use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PySlice};
+use pyo3::Bound as PyBound;
 use pyo3::{intern, PyErr};
 use safetensors::slice::TensorIndexer;
 use safetensors::tensor::{Dtype, Metadata, SafeTensors, TensorInfo, TensorView};
+use safetensors::View;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::iter::FromIterator;
 use std::ops::Bound;
-use pyo3::{Bound as PyBound};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,57 +25,76 @@ static TENSORFLOW_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
 static FLAX_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
 static MLX_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
 
-fn prepare(tensor_dict: HashMap<String, &PyDict>) -> PyResult<HashMap<String, TensorView<'_>>> {
+struct PyView<'a> {
+    shape: Vec<usize>,
+    dtype: Dtype,
+    data: PyBound<'a, PyBytes>,
+    data_len: usize,
+}
+
+impl<'a> View for &PyView<'a> {
+    fn data(&self) -> std::borrow::Cow<[u8]> {
+        Cow::Borrowed(self.data.as_bytes())
+    }
+    fn shape(&self) -> &[usize] {
+        &self.shape
+    }
+    fn dtype(&self) -> Dtype {
+        self.dtype
+    }
+    fn data_len(&self) -> usize {
+        self.data_len
+    }
+}
+
+fn prepare(tensor_dict: HashMap<String, PyBound<PyDict>>) -> PyResult<HashMap<String, PyView>> {
     let mut tensors = HashMap::with_capacity(tensor_dict.len());
-    for (tensor_name, tensor_desc) in tensor_dict {
-        let mut shape: Option<Vec<usize>> = None;
-        let mut dtype: Option<Dtype> = None;
-        let mut data: Option<&[u8]> = None;
-        for (key, value) in tensor_desc {
-            let key: &str = key.extract()?;
-            match key {
-                "shape" => shape = value.extract()?,
-                "dtype" => {
-                    let value: &str = value.extract()?;
-                    dtype = match value {
-                        "bool" => Some(Dtype::BOOL),
-                        "int8" => Some(Dtype::I8),
-                        "uint8" => Some(Dtype::U8),
-                        "int16" => Some(Dtype::I16),
-                        "uint16" => Some(Dtype::U16),
-                        "int32" => Some(Dtype::I32),
-                        "uint32" => Some(Dtype::U32),
-                        "int64" => Some(Dtype::I64),
-                        "uint64" => Some(Dtype::U64),
-                        "float16" => Some(Dtype::F16),
-                        "float32" => Some(Dtype::F32),
-                        "float64" => Some(Dtype::F64),
-                        "bfloat16" => Some(Dtype::BF16),
-                        "float8_e4m3fn" => Some(Dtype::F8_E4M3),
-                        "float8_e5m2" => Some(Dtype::F8_E5M2),
-                        dtype_str => {
-                            return Err(SafetensorError::new_err(format!(
-                                "dtype {dtype_str} is not covered",
-                            )));
-                        }
-                    }
-                }
-                "data" => data = Some(value.extract::<&[u8]>()?),
-                _ => println!("Ignored unknown kwarg option {key}"),
-            };
-        }
-        let shape = shape.ok_or_else(|| {
-            SafetensorError::new_err(format!("Missing `shape` in {tensor_desc:?}"))
-        })?;
-        let dtype = dtype.ok_or_else(|| {
-            SafetensorError::new_err(format!("Missing `dtype` in {tensor_desc:?}"))
-        })?;
-        let data = data.ok_or_else(|| {
+    for (tensor_name, tensor_desc) in &tensor_dict {
+        let shape: Vec<usize> = tensor_desc
+            .get_item("shape")?
+            .ok_or_else(|| SafetensorError::new_err(format!("Missing `shape` in {tensor_desc:?}")))?
+            .extract()?;
+        let pydata: PyBound<PyAny> = tensor_desc.get_item("data")?.ok_or_else(|| {
             SafetensorError::new_err(format!("Missing `data` in {tensor_desc:?}"))
         })?;
-        let tensor = TensorView::new(dtype, shape, data)
-            .map_err(|e| SafetensorError::new_err(format!("Error preparing tensor view: {e:?}")))?;
-        tensors.insert(tensor_name, tensor);
+        // Make sure it's extractable first.
+        let data: &[u8] = pydata.extract()?;
+        let data_len = data.len();
+        let data: PyBound<PyBytes> = pydata.extract()?;
+        let pydtype = tensor_desc.get_item("dtype")?.ok_or_else(|| {
+            SafetensorError::new_err(format!("Missing `dtype` in {tensor_desc:?}"))
+        })?;
+        let dtype: &str = pydtype.extract()?;
+        let dtype = match dtype {
+            "bool" => Dtype::BOOL,
+            "int8" => Dtype::I8,
+            "uint8" => Dtype::U8,
+            "int16" => Dtype::I16,
+            "uint16" => Dtype::U16,
+            "int32" => Dtype::I32,
+            "uint32" => Dtype::U32,
+            "int64" => Dtype::I64,
+            "uint64" => Dtype::U64,
+            "float16" => Dtype::F16,
+            "float32" => Dtype::F32,
+            "float64" => Dtype::F64,
+            "bfloat16" => Dtype::BF16,
+            "float8_e4m3fn" => Dtype::F8_E4M3,
+            "float8_e5m2" => Dtype::F8_E5M2,
+            dtype_str => {
+                return Err(SafetensorError::new_err(format!(
+                    "dtype {dtype_str} is not covered",
+                )));
+            }
+        };
+
+        let tensor = PyView {
+            shape,
+            dtype,
+            data,
+            data_len,
+        };
+        tensors.insert(tensor_name.to_string(), tensor);
     }
     Ok(tensors)
 }
@@ -92,10 +112,10 @@ fn prepare(tensor_dict: HashMap<String, &PyDict>) -> PyResult<HashMap<String, Te
 ///     (`bytes`):
 ///         The serialized content.
 #[pyfunction]
-#[pyo3(text_signature = "(tensor_dict, metadata=None)")]
+#[pyo3(signature = (tensor_dict, metadata=None))]
 fn serialize<'b>(
     py: Python<'b>,
-    tensor_dict: HashMap<String, &PyDict>,
+    tensor_dict: HashMap<String, PyBound<PyDict>>,
     metadata: Option<HashMap<String, String>>,
 ) -> PyResult<PyBound<'b, PyBytes>> {
     let tensors = prepare(tensor_dict)?;
@@ -121,9 +141,9 @@ fn serialize<'b>(
 ///     (`bytes`):
 ///         The serialized content.
 #[pyfunction]
-#[pyo3(text_signature = "(tensor_dict, filename, metadata=None)")]
+#[pyo3(signature = (tensor_dict, filename, metadata=None))]
 fn serialize_file(
-    tensor_dict: HashMap<String, &PyDict>,
+    tensor_dict: HashMap<String, PyBound<PyDict>>,
     filename: PathBuf,
     metadata: Option<HashMap<String, String>>,
 ) -> PyResult<()> {
@@ -144,7 +164,7 @@ fn serialize_file(
 ///         The deserialized content is like:
 ///             [("tensor_name", {"shape": [2, 3], "dtype": "F32", "data": b"\0\0.." }), (...)]
 #[pyfunction]
-#[pyo3(text_signature = "(bytes)")]
+#[pyo3(signature = (bytes))]
 fn deserialize(py: Python, bytes: &[u8]) -> PyResult<Vec<(String, HashMap<String, PyObject>)>> {
     let safetensor = SafeTensors::deserialize(bytes)
         .map_err(|e| SafetensorError::new_err(format!("Error while deserializing: {e:?}")))?;
@@ -215,7 +235,7 @@ enum Framework {
 }
 
 impl<'source> FromPyObject<'source> for Framework {
-    fn extract(ob: &'source PyAny) -> PyResult<Self> {
+    fn extract_bound(ob: &PyBound<'source, PyAny>) -> PyResult<Self> {
         let name: String = ob.extract()?;
         match &name[..] {
             "pt" => Ok(Framework::Pytorch),
@@ -245,10 +265,27 @@ enum Device {
     Mps,
     Npu(usize),
     Xpu(usize),
+    Xla(usize),
+    /// User didn't specify acceletor, torch
+    /// is responsible for choosing.
+    Anonymous(usize),
+}
+
+/// Parsing the device index.
+fn parse_device(name: &str) -> PyResult<usize> {
+    let tokens: Vec<_> = name.split(':').collect();
+    if tokens.len() == 2 {
+        let device: usize = tokens[1].parse()?;
+        Ok(device)
+    } else {
+        Err(SafetensorError::new_err(format!(
+            "device {name} is invalid"
+        )))
+    }
 }
 
 impl<'source> FromPyObject<'source> for Device {
-    fn extract(ob: &'source PyAny) -> PyResult<Self> {
+    fn extract_bound(ob: &PyBound<'source, PyAny>) -> PyResult<Self> {
         if let Ok(name) = ob.extract::<String>() {
             match &name[..] {
                 "cpu" => Ok(Device::Cpu),
@@ -256,45 +293,17 @@ impl<'source> FromPyObject<'source> for Device {
                 "mps" => Ok(Device::Mps),
                 "npu" => Ok(Device::Npu(0)),
                 "xpu" => Ok(Device::Xpu(0)),
-                name if name.starts_with("cuda:") => {
-                    let tokens: Vec<_> = name.split(':').collect();
-                    if tokens.len() == 2 {
-                        let device: usize = tokens[1].parse()?;
-                        Ok(Device::Cuda(device))
-                    } else {
-                        Err(SafetensorError::new_err(format!(
-                            "device {name} is invalid"
-                        )))
-                    }
-                }
-                name if name.starts_with("npu:") => {
-                    let tokens: Vec<_> = name.split(':').collect();
-                    if tokens.len() == 2 {
-                        let device: usize = tokens[1].parse()?;
-                        Ok(Device::Npu(device))
-                    } else {
-                        Err(SafetensorError::new_err(format!(
-                            "device {name} is invalid"
-                        )))
-                    }
-                }
-                name if name.starts_with("xpu:") => {
-                    let tokens: Vec<_> = name.split(':').collect();
-                    if tokens.len() == 2 {
-                        let device: usize = tokens[1].parse()?;
-                        Ok(Device::Xpu(device))
-                    } else {
-                        Err(SafetensorError::new_err(format!(
-                            "device {name} is invalid"
-                        )))
-                    }
-                }
+                "xla" => Ok(Device::Xla(0)),
+                name if name.starts_with("cuda:") => parse_device(name).map(Device::Cuda),
+                name if name.starts_with("npu:") => parse_device(name).map(Device::Npu),
+                name if name.starts_with("xpu:") => parse_device(name).map(Device::Xpu),
+                name if name.starts_with("xla:") => parse_device(name).map(Device::Xla),
                 name => Err(SafetensorError::new_err(format!(
                     "device {name} is invalid"
                 ))),
             }
         } else if let Ok(number) = ob.extract::<usize>() {
-            Ok(Device::Cuda(number))
+            Ok(Device::Anonymous(number))
         } else {
             Err(SafetensorError::new_err(format!("device {ob} is invalid")))
         }
@@ -309,6 +318,8 @@ impl IntoPy<PyObject> for Device {
             Device::Mps => "mps".into_py(py),
             Device::Npu(n) => format!("npu:{n}").into_py(py),
             Device::Xpu(n) => format!("xpu:{n}").into_py(py),
+            Device::Xla(n) => format!("xla:{n}").into_py(py),
+            Device::Anonymous(n) => n.into_py(py),
         }
     }
 }
@@ -437,7 +448,8 @@ impl Open {
                         // .getattr(intern!(py, "from_file"))?
                         .call_method("from_file", (py_filename,), Some(&kwargs))?;
 
-                    let untyped: PyBound<'_, PyAny> = match storage.getattr(intern!(py, "untyped")) {
+                    let untyped: PyBound<'_, PyAny> = match storage.getattr(intern!(py, "untyped"))
+                    {
                         Ok(untyped) => untyped,
                         Err(_) => storage.getattr(intern!(py, "_untyped"))?,
                     };
@@ -515,7 +527,8 @@ impl Open {
                 let data =
                     &mmap[info.data_offsets.0 + self.offset..info.data_offsets.1 + self.offset];
 
-                let array: PyObject = Python::with_gil(|py| PyByteArray::new_bound(py, data).into_py(py));
+                let array: PyObject =
+                    Python::with_gil(|py| PyByteArray::new_bound(py, data).into_py(py));
 
                 create_tensor(
                     &self.framework,
@@ -558,27 +571,36 @@ impl Open {
                     if byteorder == "big" {
                         let inplace_kwargs =
                             [(intern!(py, "inplace"), false.into_py(py))].into_py_dict_bound(py);
-                        if info.dtype == Dtype::BF16 {
-                            let torch_f16: PyObject = get_pydtype(torch, Dtype::F16, false)?;
-                            tensor = tensor.getattr(intern!(py, "to"))?.call(
-                                (),
-                                Some(&[(intern!(py, "dtype"), torch_f16)].into_py_dict_bound(py)),
-                            )?;
-                        }
 
+                        let intermediary_dtype = match info.dtype {
+                            Dtype::BF16 => Some(Dtype::F16),
+                            Dtype::F8_E5M2 => Some(Dtype::U8),
+                            Dtype::F8_E4M3 => Some(Dtype::U8),
+                            _ => None,
+                        };
+                        if let Some(intermediary_dtype) = intermediary_dtype {
+                            // Reinterpret to f16 for numpy compatibility.
+                            let dtype: PyObject = get_pydtype(torch, intermediary_dtype, false)?;
+                            let view_kwargs =
+                                [(intern!(py, "dtype"), dtype)].into_py_dict_bound(py);
+                            tensor = tensor
+                                .getattr(intern!(py, "view"))?
+                                .call((), Some(&view_kwargs))?;
+                        }
                         let numpy = tensor
                             .getattr(intern!(py, "numpy"))?
                             .call0()?
                             .getattr("byteswap")?
                             .call((), Some(&inplace_kwargs))?;
                         tensor = torch.getattr(intern!(py, "from_numpy"))?.call1((numpy,))?;
-
-                        if info.dtype == Dtype::BF16 {
-                            let torch_bf16: PyObject = get_pydtype(torch, Dtype::BF16, false)?;
-                            tensor = tensor.getattr(intern!(py, "to"))?.call(
-                                (),
-                                Some(&[(intern!(py, "dtype"), torch_bf16)].into_py_dict_bound(py)),
-                            )?;
+                        if intermediary_dtype.is_some() {
+                            // Reinterpret to f16 for numpy compatibility.
+                            let dtype: PyObject = get_pydtype(torch, info.dtype, false)?;
+                            let view_kwargs =
+                                [(intern!(py, "dtype"), dtype)].into_py_dict_bound(py);
+                            tensor = tensor
+                                .getattr(intern!(py, "view"))?
+                                .call((), Some(&view_kwargs))?;
                         }
                     }
 
@@ -586,8 +608,7 @@ impl Open {
                     if self.device != Device::Cpu {
                         let device: PyObject = self.device.clone().into_py(py);
                         let kwargs = PyDict::new_bound(py);
-                        tensor = tensor
-                            .call_method("to", (device,), Some(&kwargs))?;
+                        tensor = tensor.call_method("to", (device,), Some(&kwargs))?;
                     }
                     Ok(tensor.into_py(py))
                     // torch.asarray(storage[start + n : stop + n], dtype=torch.uint8).view(dtype=dtype).reshape(shape)
@@ -661,7 +682,7 @@ impl safe_open {
 #[pymethods]
 impl safe_open {
     #[new]
-    #[pyo3(text_signature = "(self, filename, framework, device=\"cpu\")")]
+    #[pyo3(signature = (filename, framework, device=Some(Device::Cpu)))]
     fn new(filename: PathBuf, framework: Framework, device: Option<Device>) -> PyResult<Self> {
         let inner = Some(Open::new(filename, framework, device)?);
         Ok(Self { inner })
@@ -748,7 +769,7 @@ struct PySafeSlice {
 
 #[derive(FromPyObject)]
 enum SliceIndex<'a> {
-    Slice(&'a PySlice),
+    Slice(PyBound<'a, PySlice>),
     Index(i32),
 }
 
@@ -820,10 +841,27 @@ impl PySafeSlice {
     pub fn __getitem__(&self, slices: &PyBound<'_, PyAny>) -> PyResult<PyObject> {
         match &self.storage.as_ref() {
             Storage::Mmap(mmap) => {
-                let slices: Slice = slices.extract()?;
+                let pyslices = slices;
+                let slices: Slice = pyslices.extract()?;
+                let is_list = pyslices.is_instance_of::<PyList>();
                 let slices: Vec<SliceIndex> = match slices {
                     Slice::Slice(slice) => vec![slice],
-                    Slice::Slices(slices) => slices,
+                    Slice::Slices(slices) => {
+                        if slices.is_empty() && is_list {
+                            vec![SliceIndex::Slice(PySlice::new_bound(
+                                pyslices.py(),
+                                0,
+                                0,
+                                0,
+                            ))]
+                        } else if is_list {
+                            return Err(SafetensorError::new_err(
+                                "Non empty lists are not implemented",
+                            ));
+                        } else {
+                            slices
+                        }
+                    }
                 };
                 let data = &mmap[self.info.data_offsets.0 + self.offset
                     ..self.info.data_offsets.1 + self.offset];
@@ -905,15 +943,39 @@ impl PySafeSlice {
                     .getattr(intern!(py, "view"))?
                     .call((), Some(&view_kwargs))?;
                 if byteorder == "big" {
+                    // Important, do NOT use inplace otherwise the slice itself
+                    // is byteswapped, meaning multiple calls will fails
                     let inplace_kwargs =
                         [(intern!(py, "inplace"), false.into_py(py))].into_py_dict_bound(py);
 
+                    let intermediary_dtype = match self.info.dtype {
+                        Dtype::BF16 => Some(Dtype::F16),
+                        Dtype::F8_E5M2 => Some(Dtype::U8),
+                        Dtype::F8_E4M3 => Some(Dtype::U8),
+                        _ => None,
+                    };
+                    if let Some(intermediary_dtype) = intermediary_dtype {
+                        // Reinterpret to f16 for numpy compatibility.
+                        let dtype: PyObject = get_pydtype(torch, intermediary_dtype, false)?;
+                        let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict_bound(py);
+                        tensor = tensor
+                            .getattr(intern!(py, "view"))?
+                            .call((), Some(&view_kwargs))?;
+                    }
                     let numpy = tensor
                         .getattr(intern!(py, "numpy"))?
                         .call0()?
                         .getattr("byteswap")?
                         .call((), Some(&inplace_kwargs))?;
                     tensor = torch.getattr(intern!(py, "from_numpy"))?.call1((numpy,))?;
+                    if intermediary_dtype.is_some() {
+                        // Reinterpret to f16 for numpy compatibility.
+                        let dtype: PyObject = get_pydtype(torch, self.info.dtype, false)?;
+                        let view_kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict_bound(py);
+                        tensor = tensor
+                            .getattr(intern!(py, "view"))?
+                            .call((), Some(&view_kwargs))?;
+                    }
                 }
                 tensor = tensor
                     .getattr(intern!(py, "reshape"))?
@@ -923,8 +985,7 @@ impl PySafeSlice {
                 if self.device != Device::Cpu {
                     let device: PyObject = self.device.clone().into_py(py);
                     let kwargs = PyDict::new_bound(py);
-                    tensor = tensor
-                        .call_method("to", (device,), Some(&kwargs))?;
+                    tensor = tensor.call_method("to", (device,), Some(&kwargs))?;
                 }
                 Ok(tensor.into_py(py))
             }),
@@ -974,12 +1035,12 @@ fn create_tensor<'a>(
         let dtype: PyObject = get_pydtype(module, dtype, is_numpy)?;
         let count: usize = shape.iter().product();
         let shape = shape.to_vec();
-        let shape: PyObject = shape.into_py(py);
         let tensor = if count == 0 {
             // Torch==1.10 does not allow frombuffer on empty buffers so we create
             // the tensor manually.
             // let zeros = module.getattr(intern!(py, "zeros"))?;
-            let args = (shape.clone(),);
+            let shape: PyObject = shape.clone().into_py(py);
+            let args = (shape,);
             let kwargs = [(intern!(py, "dtype"), dtype)].into_py_dict_bound(py);
             module.call_method("zeros", args, Some(&kwargs))?
         } else {
@@ -989,7 +1050,17 @@ fn create_tensor<'a>(
                 (intern!(py, "dtype"), dtype),
             ]
             .into_py_dict_bound(py);
-            module.call_method("frombuffer", (), Some(&kwargs))?
+            let mut tensor = module.call_method("frombuffer", (), Some(&kwargs))?;
+            let sys = PyModule::import_bound(py, intern!(py, "sys"))?;
+            let byteorder: String = sys.getattr(intern!(py, "byteorder"))?.extract()?;
+            if byteorder == "big" {
+                let inplace_kwargs =
+                    [(intern!(py, "inplace"), false.into_py(py))].into_py_dict_bound(py);
+                tensor = tensor
+                    .getattr("byteswap")?
+                    .call((), Some(&inplace_kwargs))?;
+            }
+            tensor
         };
         let mut tensor: PyBound<'_, PyAny> = tensor.call_method1("reshape", (shape,))?;
         let tensor = match framework {
@@ -1029,8 +1100,7 @@ fn create_tensor<'a>(
                 if device != &Device::Cpu {
                     let device: PyObject = device.clone().into_py(py);
                     let kwargs = PyDict::new_bound(py);
-                    tensor = tensor
-                        .call_method("to", (device,), Some(&kwargs))?;
+                    tensor = tensor.call_method("to", (device,), Some(&kwargs))?;
                 }
                 tensor
             }
@@ -1067,7 +1137,9 @@ fn get_pydtype(module: &PyBound<'_, PyModule>, dtype: Dtype, is_numpy: bool) -> 
             Dtype::I8 => module.getattr(intern!(py, "int8"))?.into(),
             Dtype::BOOL => {
                 if is_numpy {
-                    py.import_bound("builtins")?.getattr(intern!(py, "bool"))?.into()
+                    py.import_bound("builtins")?
+                        .getattr(intern!(py, "bool"))?
+                        .into()
                 } else {
                     module.getattr(intern!(py, "bool"))?.into()
                 }
@@ -1098,7 +1170,10 @@ fn _safetensors_rust(m: &PyBound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(serialize_file, m)?)?;
     m.add_function(wrap_pyfunction!(deserialize, m)?)?;
     m.add_class::<safe_open>()?;
-    m.add("SafetensorError", m.py().get_type_bound::<SafetensorError>())?;
+    m.add(
+        "SafetensorError",
+        m.py().get_type_bound::<SafetensorError>(),
+    )?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
